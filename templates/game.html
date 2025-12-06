@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Game - Room {{ room_id }}</title>
+    <script src="/static/socket.io.min.js"></script>
+    <script src="/static/script.js"></script>
+    <style>
+        .card { display: inline-block; margin: 5px; padding: 10px; border: 1px solid #000; width: 50px; text-align: center; }
+        .red { color: red; }
+        .black { color: black; }
+    </style>
+</head>
+<body>
+    <h1>Game Started! (Room {{ room_id }})</h1>
+    <div id="players-list"></div>
+    <div id="community"></div>
+    <div id="your-hand"></div>
+    <div id="pot">Pot: 0</div>
+    <div id="turn"></div>
+    <div id="timer"></div>
+    <div id="actions"></div>
+    <button id="fold">Fold</button>
+    <button id="leave">Leave Room</button>
+    <script>
+        const roomId = '{{ room_id }}';
+        const playerId = prompt('Confirm your ID:');
+        initGameSocket(roomId, playerId);
+    </script>
+</body>
+</html>

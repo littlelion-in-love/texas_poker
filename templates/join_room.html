@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Join Room</title>
+    <style>
+        #room-dropdown { display: none; height: 200px; overflow-y: scroll; }  /* 可滚动，显示约10个 */
+        .arrow { cursor: pointer; margin-left: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Join Room</h1>
+    {% if error %}<p style="color:red;">{{ error }}</p>{% endif %}
+    <form method="POST">
+        <label>Room ID:</label> <input type="text" name="room_id" id="room_id" required>
+        <span class="arrow" onclick="toggleDropdown()">▼</span><br>
+        <select id="room-dropdown" multiple size="10" onchange="selectRoom(this)">
+            {% for r in rooms %}
+            <option value="{{ r }}">{{ r }}</option>
+            {% endfor %}
+        </select>
+        <label>Your ID:</label> <input type="text" name="player_id" required><br>
+        <button type="submit">Join</button>
+    </form>
+    <script>
+        function toggleDropdown() {
+            const dropdown = document.getElementById('room-dropdown');
+            dropdown.style.display = dropdown.style.display === 'none' ? 'block' : 'none';
+        }
+        function selectRoom(select) {
+            document.getElementById('room_id').value = select.value;
+            toggleDropdown();
+        }
+    </script>
+</body>
+</html>

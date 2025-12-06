@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Room {{ room_id }}</title>
+    <script src="/static/socket.io.min.js"></script>
+    <script src="/static/script.js"></script>
+</head>
+<body>
+    <h1>Room {{ room_id }} - Waiting for Players</h1>
+    <div id="players"></div>
+    {% if creator == 'your_creator_check' %}  <!-- 替换为实际检查, e.g., session -->
+    <button id="start">Start Game</button>
+    {% endif %}
+    <button id="leave">Leave Room</button>
+    <script>
+        const roomId = '{{ room_id }}';
+        const playerId = prompt('Confirm your ID:');
+        initSocket(roomId, playerId);
+    </script>
+</body>
+</html>
