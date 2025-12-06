@@ -1,6 +1,5 @@
 import eventlet
 eventlet.monkey_patch()
-from forms import LoginForm
 from flask import Flask, render_template, request, redirect, url_for, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import random
@@ -11,8 +10,6 @@ from enum import Enum
 from collections import defaultdict
 import os
 
-with app.test_request_context():
-    form = LoginForm()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
