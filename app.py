@@ -11,7 +11,7 @@ from enum import Enum
 from collections import defaultdict
 import os
 
-with app.test_request_context()
+with app.test_request_context():
     form = LoginForm()
 
 app = Flask(__name__)
