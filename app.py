@@ -1,6 +1,4 @@
-import eventlet
-eventlet.monkey_patch()
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import Flask, render_template, request, redirect, url_for, jsonify, session
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import random
 import string
@@ -10,18 +8,17 @@ from enum import Enum
 from collections import defaultdict
 import os
 
-
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
+app.config['SESSION_TYPE'] = 'filesystem'  # For session persistence
 socketio = SocketIO(app)
 
 rooms = {}
 BIG_BLIND = 100
-SMALL_BLIND = 50
+SMALL_BLIND = BIG_BLIND // 2
 SUITS = {'s': '♠', 'h': '♥', 'd': '♦', 'c': '♣'}
 COLORS = {'s': 'black', 'h': 'red', 'd': 'red', 'c': 'black'}
 RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-MIN_STACK = 1200
 
 class Street(Enum):
     PREFLOP = 0
@@ -36,7 +33,8 @@ def create_deck():
 def rank_value(rank):
     return RANKS.index(rank) + 2
 
-def evaluate_hand(hand):  # Full hand evaluation (5 cards)
+def evaluate_hand(hand):  # Full hand evaluation (7 cards: 2 hole + 5 community)
+    # Combine and sort ranks
     ranks = sorted([rank_value(card[:-1]) for card in hand], reverse=True)
     suits = [card[-1] for card in hand]
     flush = len(set(suits)) == 1
@@ -52,35 +50,40 @@ def evaluate_hand(hand):  # Full hand evaluation (5 cards)
     quads = [r for r, c in count.items() if c == 4]
     if quads:
         return (8, [quads[0]] + sorted([r for r in ranks if r != quads[0]], reverse=True))  # Quads
-    full_house = sorted([r for r, c in count.items() if c == 3], reverse=True) + sorted([r for r, c in count.items() if c == 2], reverse=True)
-    if len(full_house) >= 2:  # 可能有多个，但取最高
-        return (7, full_house[:2])  # Full House
+    full_house = sorted([r for r, c in count.items() if c == 3]) + sorted([r for r, c in count.items() if c == 2])
+    if len(full_house) == 2:
+        return (7, full_house)  # Full House
     if flush:
         return (6, sorted(ranks, reverse=True))  # Flush
     if straight:
         return (5, ranks)  # Straight
     trips = [r for r, c in count.items() if c == 3]
     if trips:
-        return (4, [trips[0]] + sorted([r for r in ranks if r != trips[0]], reverse=True)[:2])  # Trips
+        return (4, [trips[0]] + sorted([r for r in ranks if r != trips[0]], reverse=True))  # Trips
     pairs = sorted([r for r, c in count.items() if c == 2], reverse=True)
-    if len(pairs) >= 2:
-        return (3, pairs[:2] + sorted([r for r in ranks if r not in pairs], reverse=True)[:1])  # Two Pair
+    if len(pairs) == 2:
+        return (3, pairs + sorted([r for r in ranks if r not in pairs], reverse=True))  # Two Pair
     if len(pairs) == 1:
-        return (2, [pairs[0]] + sorted([r for r in ranks if r != pairs[0]], reverse=True)[:3])  # Pair
+        return (2, [pairs[0]] + sorted([r for r in ranks if r != pairs[0]], reverse=True))  # Pair
     return (1, ranks)  # High Card
 
 def best_hand(player_hand, community):
     all_cards = player_hand + community
+    # Find best 5-card combo
     best = (0, [])
-    from itertools import combinations
-    for combo in combinations(all_cards, 5):
-        score = evaluate_hand(combo)
-        if score > best:
-            best = score
+    for i in range(len(all_cards)):
+        for j in range(i+1, len(all_cards)):
+            for k in range(j+1, len(all_cards)):
+                for l in range(k+1, len(all_cards)):
+                    for m in range(l+1, len(all_cards)):
+                        combo = [all_cards[i], all_cards[j], all_cards[k], all_cards[l], all_cards[m]]
+                        score = evaluate_hand(combo)
+                        if score > best:
+                            best = score
     return best
 
 def determine_winners(room):
-    active_players = [p for p in room['player_order'] if not room['folded'][p] and room['players'][p] >= 0]
+    active_players = [p for p in room['player_order'] if not room['folded'][p]]
     if len(active_players) == 1:
         return {active_players[0]: room['pot']}
     
@@ -93,24 +96,19 @@ def determine_winners(room):
     sorted_players = sorted(active_players, key=lambda p: hands[p], reverse=True)
     
     # Handle side pots
-    all_in_stacks = sorted(set(room['bets'][p] for p in room['player_order'] if p in room['bets']))
+    all_in_stacks = sorted(set(room['bets'][p] for p in active_players))
     pots = {}
-    prev = 0
-    for cap in all_in_stacks:
+    for i in range(len(all_in_stacks)):
         current_pot = 0
-        contributors = [p for p in room['player_order'] if room['bets'].get(p, 0) >= cap]
-        for p in room['player_order']:
-            contrib = min(room['bets'].get(p, 0), cap) - prev
+        contributors = [p for p in active_players if room['bets'][p] >= all_in_stacks[i]]
+        for p in room['players']:
+            contrib = min(room['bets'].get(p, 0), all_in_stacks[i] if i == 0 else all_in_stacks[i] - all_in_stacks[i-1])
             current_pot += contrib
         # Award to best hand among contributors
-        contrib_hands = {p: hands[p] for p in contributors if p in active_players}
-        if contrib_hands:
-            max_score = max(contrib_hands.values())
-            winners = [p for p, s in contrib_hands.items() if s == max_score]
-            share = current_pot // len(winners)
-            for w in winners:
-                pots[w] = pots.get(w, 0) + share
-        prev = cap
+        contrib_hands = {p: hands[p] for p in contributors}
+        winners = [p for p in sorted(contributors, key=lambda p: contrib_hands[p], reverse=True) if contrib_hands[p] == max(contrib_hands.values())]
+        for w in winners:
+            pots[w] = pots.get(w, 0) + current_pot // len(winners)
     
     return pots
 
@@ -130,19 +128,18 @@ def create_room():
         multiple = request.form.get('multiple', type=int)
         if multiple not in [20, 40, 60]:
             multiple = request.form.get('custom_multiple', type=int) or 20
-        initial_stack = multiple * BIG_BLIND
-        if multiple <= 0 or initial_stack < MIN_STACK:
-            return render_template('create_room.html', error=f'Initial stack must be positive and at least {MIN_STACK}.')
         player_id = request.form['player_id']
         
         room_id = generate_room_id()
+        initial_stack = multiple * BIG_BLIND
         rooms[room_id] = {
             'creator': player_id,
             'players': {player_id: initial_stack},
-            'player_order': [player_id],
+            'player_order': [player_id],  # Order of joining
             'stack_multiple': multiple,
             'started': False
         }
+        session['player_id'] = player_id  # Store in session
         return redirect(url_for('room', room_id=room_id))
     
     return render_template('create_room.html')
@@ -160,6 +157,7 @@ def join_room():
                 initial_stack = rooms[room_id]['stack_multiple'] * BIG_BLIND
                 rooms[room_id]['players'][player_id] = initial_stack
                 rooms[room_id]['player_order'].append(player_id)
+                session['player_id'] = player_id  # Store in session
                 return redirect(url_for('room', room_id=room_id))
             else:
                 return render_template('join_room.html', error='ID already exists', rooms=active_rooms)
@@ -177,14 +175,23 @@ def room(room_id):
     if room_data['started']:
         return redirect(url_for('game', room_id=room_id))
     
-    return render_template('room.html', room_id=room_id, creator=room_data['creator'], players=room_data['player_order'])
+    player_id = session.get('player_id')
+    if not player_id or player_id not in room_data['players']:
+        return redirect(url_for('join'))  # Redirect if no session
+    
+    is_creator = (player_id == room_data['creator'])
+    return render_template('room.html', room_id=room_id, is_creator=is_creator, players=room_data['player_order'], player_id=player_id)
 
 @app.route('/game/<room_id>')
 def game(room_id):
     if room_id not in rooms or not rooms[room_id]['started']:
         return redirect(url_for('index'))
     
-    return render_template('game.html', room_id=room_id)
+    player_id = session.get('player_id')
+    if not player_id or player_id not in rooms[room_id]['players']:
+        return redirect(url_for('index'))
+    
+    return render_template('game.html', room_id=room_id, player_id=player_id)
 
 def start_hand(room_id):
     room = rooms[room_id]
@@ -197,31 +204,28 @@ def start_hand(room_id):
     room['bets'] = {p: 0 for p in room['player_order']}
     room['folded'] = {p: False for p in room['player_order']}
     room['street'] = Street.PREFLOP
-    room['dealer_index'] = (room.get('dealer_index', -1) + 1) % len(room['player_order'])
+    room['dealer_index'] = (room['dealer_index'] + 1) % len(room['player_order']) if 'dealer_index' in room else 0
     sb_index = (room['dealer_index'] + 1) % len(room['player_order'])
     bb_index = (room['dealer_index'] + 2) % len(room['player_order'])
     room['current_player'] = (room['dealer_index'] + 3) % len(room['player_order'])  # UTG starts preflop
     room['last_raise_player'] = bb_index
-    room['min_raise'] = BIG_BLIND
+    room['min_raise'] = BIG_BLIND * 2
     
     # Post blinds
     sb_player = room['player_order'][sb_index]
     bb_player = room['player_order'][bb_index]
-    sb_bet = min(SMALL_BLIND, room['players'][sb_player])
-    bb_bet = min(BIG_BLIND, room['players'][bb_player])
-    room['bets'][sb_player] = sb_bet
-    room['players'][sb_player] -= sb_bet
-    room['bets'][bb_player] = bb_bet
-    room['players'][bb_player] -= bb_bet
-    room['pot'] += sb_bet + bb_bet
+    room['bets'][sb_player] = min(SMALL_BLIND, room['players'][sb_player])
+    room['players'][sb_player] -= room['bets'][sb_player]
+    room['bets'][bb_player] = min(BIG_BLIND, room['players'][bb_player])
+    room['players'][bb_player] -= room['bets'][bb_player]
+    room['pot'] += room['bets'][sb_player] + room['bets'][bb_player]
     
     emit('update_game', get_game_state(room_id), to=room_id)
     start_timer(room_id)
 
 def next_street(room_id):
     room = rooms[room_id]
-    room['pot'] += sum(room['bets'].values())
-    room['bets'] = {p: 0 for p in room['player_order']}
+    collect_bets(room)
     if room['street'] == Street.PREFLOP:
         room['community'].extend([room['deck'].pop() for _ in range(3)])
         room['street'] = Street.FLOP
@@ -236,6 +240,7 @@ def next_street(room_id):
         showdown(room_id)
         return
     
+    room['bets'] = {p: 0 for p in room['player_order']}
     room['current_player'] = (room['dealer_index'] + 1) % len(room['player_order'])  # SB starts post-flop
     room['last_raise_player'] = None
     room['min_raise'] = BIG_BLIND
@@ -245,92 +250,73 @@ def next_street(room_id):
     else:
         showdown(room_id)
 
+def collect_bets(room):
+    room['pot'] += sum(room['bets'].values())
+    room['bets'] = {p: 0 for p in room['player_order']}
+
 def active_count(room_id):
-    room = rooms[room_id]
-    return sum(1 for p in room['player_order'] if not room['folded'][p] and room['players'][p] > 0)
+    return sum(1 for p in rooms[room_id]['player_order'] if not rooms[room_id]['folded'][p] and rooms[room_id]['players'][p] > 0)
 
 def showdown(room_id):
-    room = rooms[room_id]
-    winners = determine_winners(room)
+    winners = determine_winners(rooms[room_id])
     for w, amount in winners.items():
-        room['players'][w] += amount
-    emit('showdown', {'winners': winners, 'hands': room['hands']}, to=room_id)
-    threading.Timer(5, lambda: next_hand(room_id)).start()
-
-def next_hand(room_id):
-    if room_id in rooms:
-        room = rooms[room_id]
-        if sum(1 for stack in room['players'].values() if stack > 0) >= 2:
-            start_hand(room_id)
-        else:
-            room['started'] = False
-            emit('game_over', to=room_id)
+        rooms[room_id]['players'][w] += amount
+    emit('showdown', {'winners': winners, 'hands': rooms[room_id]['hands']}, to=room_id)
+    # Reset for next hand after delay
+    time.sleep(5)
+    if len([p for p in rooms[room_id]['players'] if rooms[room_id]['players'][p] > 0]) >= 2:
+        start_hand(room_id)
+    else:
+        rooms[room_id]['started'] = False
+        emit('game_over', to=room_id)
 
 def start_timer(room_id):
     def timeout():
         time.sleep(30)
-        if room_id in rooms and 'timer' in rooms[room_id] and rooms[room_id]['timer'] == id(threading.current_thread()):
-            handle_action(room_id, 'fold')
-    timer_thread = threading.Thread(target=timeout)
-    rooms[room_id]['timer'] = id(timer_thread)
-    timer_thread.start()
+        if 'timer' in rooms[room_id] and rooms[room_id]['timer'] == threading.current_thread():
+            handle_action(room_id, 'fold')  # Auto fold
+    timer = threading.Thread(target=timeout)
+    rooms[room_id]['timer'] = timer
+    timer.start()
 
 def handle_action(room_id, action, amount=0):
-    if room_id not in rooms:
-        return
     room = rooms[room_id]
-    current_index = room['current_player']
-    player = room['player_order'][current_index]
-    if room['players'][player] == 0:  # All-in skip
-        next_player(room_id)
-        return
-    
-    max_bet = max(room['bets'].values())
-    to_call = max_bet - room['bets'][player]
-    player_stack = room['players'][player]
-    
+    player = room['player_order'][room['current_player']]
     if action == 'fold':
         room['folded'][player] = True
     elif action == 'check':
-        if to_call > 0:
-            return
+        pass  # No bet
     elif action == 'call':
-        bet = min(to_call, player_stack)
+        to_call = max(room['bets'].values()) - room['bets'][player]
+        bet = min(to_call, room['players'][player])
         room['bets'][player] += bet
         room['players'][player] -= bet
     elif action == 'bet' or action == 'raise':
-        min_amount = BIG_BLIND if action == 'bet' else (to_call + room['min_raise'])
-        if amount <= 0 or amount < min_amount:
-            return
-        added = min(amount, player_stack)
-        room['bets'][player] += added
-        room['players'][player] -= added
-        room['min_raise'] = added if action == 'bet' else (added - to_call)
-        room['last_raise_player'] = current_index
+        to_call = max(room['bets'].values()) - room['bets'][player]
+        min_amount = max(room['min_raise'], to_call + room['min_raise']) if action == 'raise' else BIG_BLIND
+        bet = max(min_amount, amount)
+        room['bets'][player] += bet
+        room['players'][player] -= bet
+        room['min_raise'] = bet - to_call if action == 'raise' else bet
+        room['last_raise_player'] = room['current_player']
     
-    if 'timer' in room:
-        del room['timer']
+    if room['timer']:
+        room['timer'] = None  # Cancel timer
     
     if active_count(room_id) <= 1:
         showdown(room_id)
         return
     
-    next_player(room_id)
-
-def next_player(room_id):
-    room = rooms[room_id]
-    start_index = room['current_player']
+    # Next player
     while True:
         room['current_player'] = (room['current_player'] + 1) % len(room['player_order'])
         curr_p = room['player_order'][room['current_player']]
         if not room['folded'][curr_p] and room['players'][curr_p] > 0:
             break
-        if room['current_player'] == start_index:
-            break  # Avoid infinite loop
     
+    # Check if betting round complete
     max_bet = max(room['bets'].values())
-    all_matched = all(room['bets'].get(p, 0) == max_bet or room['folded'][p] or room['players'][p] == 0 for p in room['player_order'])
-    if all_matched and (room['last_raise_player'] is None or room['current_player'] == room['last_raise_player']):
+    if all(room['bets'][p] == max_bet or room['folded'][p] for p in room['player_order']) and (room['last_raise_player'] is None or room['current_player'] == room['last_raise_player']):
         next_street(room_id)
     else:
         emit('update_game', get_game_state(room_id), to=room_id)
@@ -346,8 +332,7 @@ def get_game_state(room_id):
         'bets': room['bets'],
         'folded': room['folded'],
         'current_player': room['player_order'][room['current_player']],
-        'street': room['street'].name,
-        'min_raise': room['min_raise']
+        'street': room['street'].name
     }
     return state
 
@@ -358,7 +343,7 @@ def on_join(data):
     join_room(room_id)
     emit('update_players', {'players': rooms[room_id]['player_order']}, to=room_id)
     
-    if len(rooms[room_id]['player_order']) >= 6 and not rooms[room_id]['started']:
+    if len(rooms[room_id]['player_order']) >= 6:
         rooms[room_id]['started'] = True
         emit('start_game', to=room_id)
         start_hand(room_id)
@@ -367,18 +352,18 @@ def on_join(data):
 def on_leave(data):
     room_id = data['room_id']
     player_id = data['player_id']
-    if room_id in rooms and player_id in rooms[room_id]['players']:
-        del rooms[room_id]['players'][player_id]
-        if player_id in room['player_order']:
-            room['player_order'].remove(player_id)
-        leave_room(room_id)
-        emit('update_players', {'players': rooms[room_id]['player_order']}, to=room_id)
-        
-        if player_id == rooms[room_id]['creator']:
-            del rooms[room_id]
-            emit('room_closed', to=room_id)
-        elif rooms[room_id]['started'] and player_id == room['player_order'][room['current_player']]:
-            handle_action(room_id, 'fold')
+    if room_id in rooms:
+        if player_id in rooms[room_id]['players']:
+            del rooms[room_id]['players'][player_id]
+            rooms[room_id]['player_order'].remove(player_id)
+            leave_room(room_id)
+            emit('update_players', {'players': rooms[room_id]['player_order']}, to=room_id)
+            
+            if player_id == rooms[room_id]['creator']:
+                del rooms[room_id]
+                emit('room_closed', to=room_id)
+            elif rooms[room_id]['started'] and player_id == rooms[room_id]['player_order'][rooms[room_id]['current_player']]:
+                handle_action(room_id, 'fold')
 
 @socketio.on('start')
 def on_start(data):
@@ -398,13 +383,6 @@ def on_action(data):
     room = rooms[room_id]
     if player_id == room['player_order'][room['current_player']]:
         handle_action(room_id, action, amount)
-
-@socketio.on('get_hand')
-def on_get_hand(data):
-    room_id = data['room_id']
-    player_id = data['player_id']
-    if room_id in rooms and player_id in rooms[room_id]['hands']:
-        emit('your_hand', rooms[room_id]['hands'][player_id], room=room_id)  # 广播但客户端过滤, or use to=request.sid
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
